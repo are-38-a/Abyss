@@ -2672,9 +2672,11 @@ static int glm_pack_generate(const Options& o) {
     std::fprintf(stderr, "maya generate: glm5-next serve (M3.1): GEN <max_new> [keys] <ids>, GENI <max_new> [keys] "
                          "<embeddings> <ids>; QUIT to end\n");
     // GENI: the embeddings file is one or more strata-vision records (int32 'SVE1', n, nx, ny, n_embd, then n x n_embd
-    // floats) in prompt order; their rows stand in for the prompt's <|image|> tokens, in order (GLM-5.3's image
-    // tokens take no positions of their own: the rows only replace the embeddings)
-    constexpr int64_t kGlmImageToken = 154854;   // <|image|>
+    // floats) in prompt order; their rows stand in for the prompt's image tokens, in order (GLM-5.3's <|image|>
+    // tokens take no positions of their own: the rows only replace the embeddings; DeepSeek-V4.1's picture is a span
+    // of <｜deepseek_image｜> tokens - image_start, each row's cells and image_newline, image_end - a row each, written
+    // whole by tools/ds41_vision)
+    const int64_t kImageToken = model.geometry().v41 ? 129264 : 154854;
     std::vector<int32_t> lp_ctx;   // LOGP: the context the saved state belongs to (the state before its last token)
     std::string line;
     while (next_line(line)) {
@@ -2839,7 +2841,7 @@ static int glm_pack_generate(const Options& o) {
                 }
                 if (f) std::fclose(f);
                 for (size_t i = 0; ge.empty() && i < toks.size(); ++i)
-                    if (toks[i] == kGlmImageToken) cur_img_pos.push_back((int64_t) i);
+                    if (toks[i] == kImageToken) cur_img_pos.push_back((int64_t) i);
                 if (ge.empty() && (int64_t) cur_img_pos.size() * E != (int64_t) cur_img_rows.size())
                     ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
                          std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";

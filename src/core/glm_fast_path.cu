@@ -5770,7 +5770,7 @@ bool Glm5Model::fast_token(int32_t token, std::string& err) {
     if (g.v41) {
         static const float onehot[4] = {1.0f, 0.0f, 0.0f, 0.0f};   // layer 0's attention collapses stream 0
         cudaMemcpyAsync(F->v41_pre[1], onehot, sizeof(onehot), cudaMemcpyHostToDevice, F->cs);
-        if (!dsv41_engram_token(token, err)) return false;
+        if (!dsv41_engram_token(img != nullptr ? -1 : token, err)) return false;   // (a picture's: -1, no rows)
     }
     if (gp) {
         cudaEventRecord(F->ev_gs, F->cs);

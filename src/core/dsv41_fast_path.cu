@@ -57,6 +57,7 @@ ds::Rope layer_rope(const Glm5Geometry& g, bool comp) {
 size_t al(size_t b) { return (b + 255u) & ~(size_t) 255u; }
 
 constexpr int kEngCols = 24, kEngDim = 256, kEngRowMax = 272, kEngDead = -1;
+constexpr uint64_t kEngZero = ~0ull;   // a picture's position: no row - zeros, so its gate adds nothing (engram_rows)
 constexpr int kV41Blk = 256;   // the prompt path's Engram rows a block
 
 // the Engram reads' own threads (the fast path's workers are the MoE service's: the token's rows are read before
@@ -482,9 +483,15 @@ void Glm5Model::dsv41_reset() {
 
 namespace {
 // the 48 row numbers (2 tables x 24 heads) of the token at position p; records its compressed id at p
+// tok -1: a picture's position (an image row stands in for its token) - no rows, and no later n-gram reaches past it
 bool engram_rows(V41Engram& E, int32_t tok, int64_t p, uint64_t* rows, std::string& err) {
-    if (tok < 0 || (size_t) tok >= E.tmap.size()) { err = "deepseek41: Engram: token out of range"; return false; }
     if (p < 0 || (size_t) p >= E.hist.size()) { err = "deepseek41: Engram: position past the context"; return false; }
+    if (tok == -1) {
+        E.hist[(size_t) p] = kEngDead;
+        std::fill(rows, rows + 2 * kEngCols, kEngZero);
+        return true;
+    }
+    if (tok < 0 || (size_t) tok >= E.tmap.size()) { err = "deepseek41: Engram: token out of range"; return false; }
     const int32_t cur = (int32_t) E.tmap[(size_t) tok];
     E.hist[(size_t) p] = cur;
     uint32_t ids[4];
@@ -546,6 +553,10 @@ static bool engram_read(V41Engram& E, int k, uint64_t at, uint8_t* dst, size_t n
 // table k's 24 rows (row numbers rows[0..23]) -> dst, 24 x 256 floats
 // one row of table k -> dst (256 floats), through the raw row cache
 bool engram_row(V41Engram& E, int k, uint64_t row, float* dst, std::string& err) {
+    if (row == kEngZero) {
+        std::memset(dst, 0, (size_t) kEngDim * sizeof(float));
+        return true;
+    }
     uint8_t raw[kEngRowMax];
     const int RB = E.row_bytes;
     bool hit = false;
@@ -620,6 +631,7 @@ void engram_async_loop(V41Engram* E) {
 
 // a row's raw bytes into the row cache unless there (the prefetch: no decode, no error - a failed read stays a miss)
 void engram_cache_row(V41Engram& E, int k, uint64_t row) {
+    if (row == kEngZero) return;
     uint8_t raw[kEngRowMax];
     const int RB = E.row_bytes;
     const uint64_t key = (((uint64_t) k << 63) | row) + 1;
@@ -715,8 +727,10 @@ bool Glm5Model::dsv41_engram_hash(const int32_t* toks, int64_t p0, int T, std::s
     if (!engram_sync(*E, err)) return false;   // (the pool is the background reader's too)
     engram_pf_stop(*E);
     E->chunk.resize((size_t) T * 2 * kEngCols);
-    for (int t = 0; t < T; ++t)
-        if (!engram_rows(*E, toks[t], p0 + t, E->chunk.data() + (size_t) t * 2 * kEngCols, err)) return false;
+    for (int t = 0; t < T; ++t)   // (a picture's position: -1, see engram_rows)
+        if (!engram_rows(*E, image_row(p0 + t) != nullptr ? -1 : toks[t], p0 + t,
+                         E->chunk.data() + (size_t) t * 2 * kEngCols, err))
+            return false;
     static const int pf_threads = [] {
         const char* v = getenv("STRATA_DS41_ENGRAM_PREFETCH");
         return v == nullptr ? 8 : std::max(0, std::min(16, std::atoi(v)));   // (1 = on: 8 threads; 0 = off)
@@ -776,7 +790,9 @@ bool Glm5Model::dsv41_engram_window(const int32_t* toks, int64_t p0, int T, std:
     std::vector<uint64_t> rows((size_t) T * 2 * kEngCols);
     std::vector<int> ks(rows.size());
     for (int t = 0; t < T; ++t) {
-        if (!engram_rows(*E, toks[t], p0 + t, rows.data() + (size_t) t * 2 * kEngCols, err)) return false;
+        if (!engram_rows(*E, image_row(p0 + t) != nullptr ? -1 : toks[t], p0 + t,
+                         rows.data() + (size_t) t * 2 * kEngCols, err))
+            return false;
         for (int j = 0; j < 2 * kEngCols; ++j) ks[(size_t) t * 2 * kEngCols + j] = j / kEngCols;
     }
     if (!engram_rows_par(*E, (int) rows.size(), rows.data(), 0, ks.data(), F->v41_pblk_h, err)) return false;
