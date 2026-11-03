@@ -97,6 +97,20 @@ class MarkersTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             dv.expand(m[0].group(0) * 2 + m[1].group(0), pat, encode, [2, 4])
 
+    def test_the_image_tokens_text_in_a_message_stays_text(self):
+        def enc(s):   # a tokenizer that makes the placeholder's text the image token, as parse_special does
+            out = []
+            for i, part in enumerate(s.split(dv.PLACEHOLDER)):
+                out += ([-7] if i else []) + encode(part)
+            return out
+        literal = dv.literal_ids(enc, image_token=-7)
+        self.assertNotIn(-7, literal)
+        self.assertEqual("".join(map(chr, literal)), dv.PLACEHOLDER)
+        marked, pat = dv.mark_images(self.messages())
+        ids, _ = dv.expand(marked[1]["content"], pat, enc, [3, 5], image_token=-7, literal=literal)
+        self.assertEqual(ids.count(-7), 8)
+        self.assertIn(dv.PLACEHOLDER, "".join(chr(i) for i in ids if i != -7))
+
     def test_text_only_messages_are_unchanged(self):
         msgs = [{"role": "user", "content": "plain"}]
         marked, _ = dv.mark_images(msgs)

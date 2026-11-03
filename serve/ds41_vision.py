@@ -24,6 +24,15 @@ from dataclasses import dataclass
 from pathlib import Path
 
 IMAGE_TOKEN = 129264   # <｜deepseek_image｜>
+PLACEHOLDER = "<｜deepseek_image｜>"
+
+
+def literal_ids(encode_plain, image_token: int = IMAGE_TOKEN) -> list[int]:
+    """The image token's text as plain-text ids: encoded in two halves, which no special token matches."""
+    ids = encode_plain(PLACEHOLDER)
+    if image_token not in ids:
+        return ids
+    return encode_plain(PLACEHOLDER[:6]) + encode_plain(PLACEHOLDER[6:])
 
 
 @dataclass(frozen=True)
@@ -163,22 +172,29 @@ def mark_images(messages: list[dict]) -> tuple[list[dict], re.Pattern]:
     return out, re.compile("" + nonce + r":(\d+)")
 
 
-def expand(prompt: str, pattern: re.Pattern, encode, spans: list[int], image_token: int = IMAGE_TOKEN
-           ) -> tuple[list[int], list[int]]:
+def expand(prompt: str, pattern: re.Pattern, encode, spans: list[int], image_token: int = IMAGE_TOKEN,
+           literal: list[int] | None = None) -> tuple[list[int], list[int]]:
     """The rendered prompt -> its ids, each image marker replaced by its picture's span (spans[k] image tokens).
-    -> (ids, the pictures' k in the order the prompt has them)."""
+    The image token's own text in the prompt (a message that quotes it) becomes `literal`, its ids as plain text, so
+    only the markers are pictures.  -> (ids, the pictures' k in the order the prompt has them)."""
+    def text(s: str) -> list[int]:
+        out = encode(s)
+        if literal is None or image_token not in out:
+            return out
+        return [x for t in out for x in (literal if t == image_token else (t,))]
+
     ids: list[int] = []
     order: list[int] = []
     at = 0
     for m in pattern.finditer(prompt):
-        ids += encode(prompt[at:m.start()])
+        ids += text(prompt[at:m.start()])
         k = int(m.group(1))
         if k >= len(spans) or k in order:
             raise ValueError("the prompt and its images do not match")
         ids += [image_token] * spans[k]
         order.append(k)
         at = m.end()
-    ids += encode(prompt[at:])
+    ids += text(prompt[at:])
     if len(order) != len(spans):
         raise ValueError("the prompt and its images do not match")
     return ids, order
