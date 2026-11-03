@@ -426,6 +426,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(abyss_gpu_tune src/program/gpu_tune.cpp)
   target_include_directories(abyss_gpu_tune PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(abyss_gpu_tune PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  # DeepSeek-V4.1's image encoder for the server's on-demand vision path (tools/ds41_vision; CUDA only)
+  if(STRATA_ENABLE_CUDA)
+    add_executable(ds41-vision tools/ds41_vision/main.cpp tools/ds41_vision/ds4_vision.cu)
+    target_include_directories(ds41-vision PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(ds41-vision PRIVATE CUDA::cublas ${_strata_gpu_runtime_target})
+  endif()
 
   # the iGPU lane (src/igpu/igpu_lane.cpp, STRATA_GLM_IGPU=1): glm_fast's expert kernels built by ROCm's hipcc into
   # libabyss_igpu.so beside the engine, which loads it at run time - a separate compiler, so CUDA and HIP never

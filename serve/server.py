@@ -32,6 +32,7 @@ import json
 import os
 import queue
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a
 from serve.frontend import (CALL_START, V41_IMAGE, V41_IMAGE_SENTINEL, ChatTemplate, Event, OutputParser,  # noqa: E402
                             anthropic_to_messages, effort_kwargs, effort_level, images_of, openai_to_messages,
                             v41_images_as_text)
+from serve import ds41_vision  # noqa: E402
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve.update import Updater  # noqa: E402
 
@@ -984,6 +986,56 @@ class Vision:
             self.proc.kill()
 
 
+class DS41Vision(Vision):
+    """DeepSeek-V4.1's encoder (`ds41-vision`, the config's "vision": {"kind": "ds41", "exe": ..., "mmproj":
+    <vision.bin>, "model": <vision.json>}): the server resizes each picture (serve/ds41_vision.py) and hands the
+    encoder its pixels; the encoder writes the picture's whole span, one row a prompt position.  Started, lent its
+    memory and ended as Vision."""
+
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, start: bool = True):
+        self.g = ds41_vision.Geometry.from_json(cfg["model"], cfg.get("max_tokens"))
+        super().__init__(cfg, log=log, env=env, start=start)
+
+    def encode(self, source: str) -> tuple[Path, int]:
+        """-> (the span's rows, a strata-vision record; the span's length in prompt tokens)."""
+        pic = ds41_vision.prepare(self.load(source), self.g)
+        key = hashlib.sha256(struct.pack("<ii", pic.width, pic.height) + pic.rgb).hexdigest()[:32]
+        with self.lock:
+            if key in self.cache:
+                return self.cache[key]
+            if self.proc is None:
+                self._start()
+            img, out = self.dir / f"{key}.dsr", self.dir / f"{key}.sve"
+            ds41_vision.write_dsr(img, pic)
+            self.proc.stdin.write(f"ENC {img} {out}\n")
+            self.proc.stdin.flush()
+            try:
+                line = readline_within(self.proc, env_seconds("STRATA_VISION_ENCODE_S", 120),
+                                       "the vision encoder did not answer").strip()
+            except TimeoutError as e:
+                img.unlink(missing_ok=True)
+                self._stop()
+                raise ValueError(f"the image could not be read: {e} (STRATA_VISION_ENCODE_S raises it)") from None
+            img.unlink(missing_ok=True)
+            if not line.startswith("OK"):
+                raise ValueError("the image could not be read: " + (line[4:] if line.startswith("ERR") else
+                                                                     "the vision encoder stopped"))
+            n = int(line.split()[1])
+            if n != pic.tokens:
+                raise ValueError(f"the image could not be read: the encoder wrote {n} rows for a span of "
+                                 f"{pic.tokens} tokens")
+            self.cache[key] = (out, n)
+            if len(self.cache) > 64:                                   # oldest first
+                old = next(iter(self.cache))
+                self.cache.pop(old)[0].unlink(missing_ok=True)
+            return self.cache[key]
+
+
+def vision_class(vcfg: dict) -> type[Vision]:
+    """The encoder the config names: "kind": "ds41" is DeepSeek-V4.1's, anything else strata-vision."""
+    return DS41Vision if vcfg.get("kind") == "ds41" else Vision
+
+
 def vision_footprint(vcfg: dict, env: dict, cache_file: Path, gpu: int) -> tuple[int, int] | None:
     """(image token cap, bytes) for the on-demand vision encoder on THIS machine's first GPU: measured once by
     `strata-vision --measure` (before the model loads, so the GPU is otherwise idle) and cached per encoder file, cap
@@ -1672,11 +1724,14 @@ class Service:
         if self.default_effort and "reasoning_effort" not in kwargs and "enable_thinking" not in kwargs:
             kwargs = {**kwargs, **effort_kwargs(self.default_effort)}   # the run config's thinking level
         images = images_of(messages)
+        ds41 = bool(images) and isinstance(self.vision, DS41Vision)
+        if ds41:   # DeepSeek-V4.1's template renders no images: the server's own marker where each one sits
+            messages, marks = ds41_vision.mark_images(messages)
         # DeepSeek V4.1: every image becomes a sentinel in the text.  The GGUF templates print a message's content as it
         # is; the official one writes its own <｜deepseek_image｜> for an image block, which the path below would not take
         # for an image (no start marker before it), so it gets the sentinel too: the same prompt, the blocks joined by a
         # blank line either way
-        v41_images = bool(images) and self.template.dsv4
+        v41_images = bool(images) and self.template.dsv4 and not ds41
         if v41_images:
             messages = v41_images_as_text(messages)
         prompt = self.template.render(messages, tools=tools, **kwargs)
@@ -1692,7 +1747,10 @@ class Service:
             prefill = CALL_START + (force if glm_calls else "\n" + (f"<function={force}>\n" if force else ""))
             prompt += prefill
         given["_prefill"] = prefill
-        if v41_images:
+        self.embeddings.path = None
+        if ds41:
+            ids = self._ds41_ids(prompt, marks, images)
+        elif v41_images:
             # the prompt up to each sentinel, then None: this image's place (expanded to its rows below)
             pieces = prompt.split(V41_IMAGE_SENTINEL)
             if len(pieces) - 1 != len(images):
@@ -1704,8 +1762,7 @@ class Service:
                     ids.append(None)
         else:
             ids = self.tok.encode(prompt, parse_special=True)
-        self.embeddings.path = None
-        if images:
+        if images and not ds41:
             if self.vision is None:
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
@@ -1759,6 +1816,20 @@ class Service:
                                  f"({self.engine.max_context}); requests are never truncated")
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
+
+    def _ds41_ids(self, prompt: str, marks, images: list[str]) -> list[int]:
+        """DeepSeek-V4.1: the pictures encoded (in the FIFO, as prepare's other encodes), the prompt's ids with each
+        marker replaced by its picture's span, and the spans' rows in prompt order as the request's GENI file."""
+        with self.fifo, self.vision.active():
+            encoded = [self.vision.encode(src) for src in images]
+        ids, order = ds41_vision.expand(prompt, marks, lambda s: self.tok.encode(s, parse_special=True),
+                                        [n for _, n in encoded], self.vision.g.image_token)
+        combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
+        with open(combined, "wb") as f:
+            for k in order:
+                f.write(encoded[k][0].read_bytes())
+        self.embeddings.path = combined
+        return ids
 
     def count_tokens(self, req: dict) -> dict:
         """POST /api/tokens: how many tokens this chat request's prompt takes - the same template, thinking level,
@@ -3450,7 +3521,7 @@ def main() -> int:
                       "image tokens", flush=True)
         if vcfg and not on_demand:
             print("loading the vision encoder ...", flush=True)
-            vision = Vision(vcfg, log=vlog, env=venv)
+            vision = vision_class(vcfg)(vcfg, log=vlog, env=venv)
         print("loading the model (the first start takes a minute or two) ...", flush=True)
         if len(gpu_list(cfg)) > 1:
             print(f"[maya] layer split across GPUs {gpu_list(cfg)} ({cfg.get('layer_split') or 'auto'})", flush=True)
@@ -3459,7 +3530,7 @@ def main() -> int:
         if on_demand:
             lent = int(engine.info.get("vision_lend") or 0)
             if lent > 0:
-                vision = Vision(vcfg, log=vlog, env=venv, start=False)
+                vision = vision_class(vcfg)(vcfg, log=vlog, env=venv, start=False)
                 vision.lend = lambda: engine.command("VLEND", "VLENT")
                 vision.reclaim = lambda: engine.command("VRECLAIM", "VRECLAIMED")
                 print(f"[maya] images: the vision encoder starts when a picture arrives, in {lent / 2**30:.2f} GB "
@@ -3467,7 +3538,7 @@ def main() -> int:
             else:   # the model's GPU memory is too small to lend that much (or an engine without lending)
                 print("[maya] images: the model cannot lend the vision encoder its GPU memory here - the encoder "
                       "runs on the CPU", flush=True)
-                vision = Vision(dict(vcfg, gpu=False), log=vlog, env=venv)
+                vision = vision_class(vcfg)(dict(vcfg, gpu=False), log=vlog, env=venv)
     else:
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [
             "Thinking about it.</think>\n\nHello from the mock engine."]), None, {}

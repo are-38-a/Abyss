@@ -3174,7 +3174,12 @@ static int glm_pack_generate(const Options& o) {
                     ge = std::to_string(cur_img_pos.size()) + " image tokens, " +
                          std::to_string(cur_img_rows.size() / (size_t) E) + " image rows";
                 // deepseek41: image rows route with exp_probs_b_vl - without it they would run on the text bias
-                if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias())
+                // (STRATA_GLM_VL_TEXT_BIAS=1: run them on the text bias, as Maya does for GGUFs without the VL bias)
+                static const bool vl_text_bias = [] {
+                    const char* v = getenv("STRATA_GLM_VL_TEXT_BIAS");
+                    return v != nullptr && std::atoi(v) != 0;
+                }();
+                if (ge.empty() && model.geometry().v41 && !cur_img_pos.empty() && !model.has_vl_bias() && !vl_text_bias)
                     ge = "this model has no exp_probs_b_vl (set STRATA_GLM_VL_BIAS or put exp_probs_b_vl.f32 in the "
                          "pack): image input is refused";
                 if (!ge.empty()) {
