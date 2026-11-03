@@ -1822,8 +1822,9 @@ class Service:
         marker replaced by its picture's span, and the spans' rows in prompt order as the request's GENI file."""
         with self.fifo, self.vision.active():
             encoded = [self.vision.encode(src) for src in images]
+        literal = ds41_vision.literal_ids(lambda s: self.tok.encode(s, parse_special=False), self.vision.g.image_token)
         ids, order = ds41_vision.expand(prompt, marks, lambda s: self.tok.encode(s, parse_special=True),
-                                        [n for _, n in encoded], self.vision.g.image_token)
+                                        [n for _, n in encoded], self.vision.g.image_token, literal)
         combined = self.vision.dir / f"req-{uuid.uuid4().hex[:12]}.sve"
         with open(combined, "wb") as f:
             for k in order:
